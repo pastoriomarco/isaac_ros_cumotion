@@ -9,6 +9,7 @@
 
 from copy import deepcopy
 from os import path
+import traceback
 
 import threading
 import time
@@ -29,6 +30,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen
 from curobo.wrap.reacher.motion_gen import MotionGenConfig
 from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
 from curobo.wrap.reacher.motion_gen import MotionGenStatus
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Pose as RosPose, Vector3
 from isaac_manipulator_ros_python_utils.manipulator_types import (
     ObjectAttachmentShape
@@ -48,10 +50,12 @@ from moveit_msgs.msg import RobotTrajectory
 import numpy as np
 from nvblox_msgs.srv import EsdfAndGradients
 import rclpy
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer as RclpyActionServer
+from rclpy.action.server import RCLError, await_or_execute as rclpy_await_or_execute
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from tf2_ros.buffer import Buffer
@@ -61,6 +65,99 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import trimesh
 from visualization_msgs.msg import Marker
 
+
+class ActionServer(RclpyActionServer):
+    """Local wrapper to force materialization of action get-result responses."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._result_request_lock = threading.Lock()
+        self._pending_result_request_headers = {}
+        self._result_response_cache = {}
+
+    def _send_result_response_message(self, request_header, result_response):
+        try:
+            # Re-materialize at the last possible point before the rclpy C-extension send.
+            result_to_send = deserialize_message(
+                serialize_message(result_response),
+                self._action_type.Impl.GetResultService.Response,
+            )
+            with self._lock:
+                self._handle.send_result_response(request_header, result_to_send)
+        except RCLError:
+            self._logger.warn('Failed to send result response (the client may have gone away)')
+
+    async def _execute_goal(self, execute_callback, goal_handle):
+        goal_uuid = goal_handle.goal_id.uuid
+        self._logger.debug(f'Executing goal with ID {goal_uuid}')
+
+        try:
+            execute_result = await rclpy_await_or_execute(execute_callback, goal_handle)
+        except Exception as ex:
+            execute_result = self._action_type.Result()
+            self._logger.error(f'Error raised in execute callback: {ex}')
+            traceback.print_exc()
+
+        if goal_handle.is_active:
+            self._logger.warning(
+                f'Goal state not set, assuming aborted. Goal ID: {goal_uuid}'
+            )
+            goal_handle.abort()
+
+        self._logger.debug(
+            f'Goal with ID {goal_uuid} finished with state {goal_handle.status}'
+        )
+
+        result_response = self._action_type.Impl.GetResultService.Response()
+        result_response.status = goal_handle.status
+        result_response.result = execute_result
+
+        # Force a full ROS message round-trip of the wrapper response before storing/sending it.
+        result_response = deserialize_message(
+            serialize_message(result_response),
+            self._action_type.Impl.GetResultService.Response,
+        )
+        goal_uuid_bytes = bytes(goal_uuid)
+        with self._result_request_lock:
+            self._result_response_cache[goal_uuid_bytes] = result_response
+            pending_headers = self._pending_result_request_headers.pop(goal_uuid_bytes, [])
+
+        self._result_futures[goal_uuid_bytes].set_result(result_response)
+        for request_header in pending_headers:
+            self._send_result_response_message(request_header, result_response)
+
+    async def _execute_get_result_request(self, request_header_and_message):
+        request_header, result_request = request_header_and_message
+        goal_uuid = result_request.goal_id.uuid
+        goal_uuid_bytes = bytes(goal_uuid)
+
+        self._logger.debug(f'Result request received for goal with ID: {goal_uuid}')
+
+        if goal_uuid_bytes not in self._goal_handles:
+            self._logger.debug(f'Sending result response for unknown goal ID: {goal_uuid}')
+            result_response = self._action_type.Impl.GetResultService.Response()
+            result_response.status = GoalStatus.STATUS_UNKNOWN
+            self._send_result_response_message(request_header, result_response)
+            return
+
+        response_to_send = None
+        with self._result_request_lock:
+            response_to_send = self._result_response_cache.get(goal_uuid_bytes)
+            if response_to_send is None:
+                self._pending_result_request_headers.setdefault(goal_uuid_bytes, []).append(
+                    request_header
+                )
+
+        if response_to_send is not None:
+            self._send_result_response_message(request_header, response_to_send)
+
+    async def _execute_expire_goals(self, expired_goals):
+        with self._result_request_lock:
+            for goal in expired_goals:
+                goal_uuid = bytes(goal.goal_id.uuid)
+                self._pending_result_request_headers.pop(goal_uuid, None)
+                self._result_response_cache.pop(goal_uuid, None)
+        await super()._execute_expire_goals(expired_goals)
 
 class CumotionActionServer(Node):
 
